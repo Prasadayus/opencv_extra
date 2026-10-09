@@ -3643,3 +3643,215 @@ generate_batchnorm_conv_fold("batchnorm_conv_dense", 8, 16, 10, 3, 1)
 generate_batchnorm_conv_fold("batchnorm_conv_depthwise", 8, 8, 10, 3, 8)
 generate_batchnorm_conv_fold("batchnorm_conv_grouped", 16, 16, 10, 3, 4)
 generate_batchnorm_conv_fold("batchnorm_conv_1x1_mlas", 256, 256, 16, 1, 1)
+
+# ConvTranspose + Add models for the TransformLayout+Add fusion and the
+# deconvolution spatial-chunking path.
+def generate_deconv_transform_add():
+    import onnxruntime as ort
+
+    class DeconvAdd(nn.Module):
+        def __init__(self, out_channels):
+            super(DeconvAdd, self).__init__()
+            self.deconv = nn.ConvTranspose2d(8, out_channels, kernel_size=3, stride=2, padding=1,
+                                             output_padding=1, bias=True)
+
+        def forward(self, x, residual):
+            return self.deconv(x) + residual
+
+    def init_deconv(deconv):
+        with torch.no_grad():
+            deconv.weight.uniform_(-0.5, 0.5)
+            deconv.bias.uniform_(-0.2, 0.2)
+
+    def export(model, inputs, input_names, name):
+        model.eval()
+        path = os.path.join("models", name + ".onnx")
+        with torch.no_grad():
+            expected = model(*inputs)
+            torch.onnx.export(model, inputs, path, input_names=input_names,
+                              output_names=["output"], opset_version=13, dynamo=False)
+        sess = ort.InferenceSession(path)
+        actual = sess.run(None, {n: i.numpy() for n, i in zip(input_names, inputs)})[0]
+        max_diff = np.abs(actual - expected.numpy()).max()
+        assert max_diff < 1e-5, "PyTorch/onnxruntime mismatch for {}: {}".format(name, max_diff)
+        return expected
+
+    torch.manual_seed(7)
+
+    # out_channels = 16 is a multiple of the block size C0 = 8, so the fused Add covers full channel blocks
+    deconv_add = DeconvAdd(16)
+    init_deconv(deconv_add.deconv)
+    x = torch.empty(1, 8, 6, 6).uniform_(-1, 1)
+    residual = torch.empty(1, 16, 12, 12).uniform_(-1, 1)
+    export(deconv_add, (x, residual), ["input", "residual"], "deconv_transform_add")
+
+    # out_channels = 12 is not a multiple of C0 = 8, so the last channel block is partial
+    deconv_add_partial = DeconvAdd(12)
+    init_deconv(deconv_add_partial.deconv)
+    x = torch.empty(1, 8, 6, 6).uniform_(-1, 1)
+    residual = torch.empty(1, 12, 12, 12).uniform_(-1, 1)
+    export(deconv_add_partial, (x, residual), ["input", "residual"], "deconv_transform_add_partial")
+
+    # out_channels = C0 = 8 gives a single output channel block (NK1 == 1), so the deconvolution
+    # is split into spatial chunks regardless of the number of threads
+    deconv_narrow = nn.ConvTranspose2d(4, 8, kernel_size=3, stride=2, padding=1, output_padding=1, bias=True)
+    init_deconv(deconv_narrow)
+    x = torch.empty(1, 4, 5, 5).uniform_(-1, 1)
+    output = export(deconv_narrow, (x,), ["input"], "deconv_spatial_narrow")
+    np.save(os.path.join("data", "input_deconv_spatial_narrow.npy"), x.numpy())
+    np.save(os.path.join("data", "output_deconv_spatial_narrow.npy"), np.ascontiguousarray(output.numpy()))
+
+    # Same weights as deconv_transform_add with a per-channel [1, 16, 1, 1] residual broadcast over H and W
+    residual = torch.empty(1, 16, 1, 1).uniform_(-1, 1)
+    x = torch.empty(1, 8, 6, 6).uniform_(-1, 1)
+    export(deconv_add, (x, residual), ["input", "residual"], "deconv_transform_add_broadcast")
+
+generate_deconv_transform_add()
+
+# ########################## LayerNorm + Gather from one external data file ##########################
+
+def generate_layer_norm_external_data():
+    np.random.seed(0)
+    name = "layer_norm_external_data"
+    data_filename = name + ".onnx_data"
+
+    X_data       = np.random.randn(2, 3, 4).astype(np.float32)
+    scale_data   = np.random.randn(4).astype(np.float32)
+    bias_data    = np.random.randn(4).astype(np.float32)
+    indices_data = np.array([0, 2], dtype=np.int64)
+
+    payload = bytearray()
+    offsets = {}
+    for tensor_name, arr in (("scale", scale_data), ("bias", bias_data), ("indices", indices_data)):
+        offsets[tensor_name] = (len(payload), arr.nbytes)
+        payload += arr.tobytes()
+    # location is resolved against the model's own directory, so the payload sits beside it.
+    with open("models/{}".format(data_filename), "wb") as f:
+        f.write(payload)
+
+    np_to_onnx = {np.dtype("float32"): TensorProto.FLOAT, np.dtype("int64"): TensorProto.INT64}
+
+    def external_tensor(tensor_name, arr):
+        offset, length = offsets[tensor_name]
+        tensor = TensorProto()
+        tensor.name = tensor_name
+        tensor.data_type = np_to_onnx[arr.dtype]
+        tensor.dims.extend(arr.shape)
+        tensor.data_location = TensorProto.EXTERNAL
+        for key, value in (("location", data_filename), ("offset", str(offset)),
+                           ("length", str(length))):
+            entry = tensor.external_data.add()
+            entry.key, entry.value = key, value
+        return tensor
+
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, X_data.shape)
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 2, 4])
+    nodes = [helper.make_node("LayerNormalization", ["X", "scale", "bias"], ["N"],
+                              axis=-1, epsilon=1e-5),
+             helper.make_node("Gather", ["N", "indices"], ["Y"], axis=1)]
+    initializers = [external_tensor("scale", scale_data), external_tensor("bias", bias_data),
+                    external_tensor("indices", indices_data)]
+    graph = helper.make_graph(nodes, "LayerNormExternalData", [X], [Y], initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.save_model(model, "models/{}.onnx".format(name))
+    # Checked by path so the external payload resolves beside the model.
+    onnx.checker.check_model("models/{}.onnx".format(name))
+
+    import onnxruntime as ort
+    out = ort.InferenceSession("models/{}.onnx".format(name)).run(None, {"X": X_data})[0]
+    np.save("data/input_{}.npy".format(name), X_data)
+    np.save("data/output_{}.npy".format(name), out)
+
+generate_layer_norm_external_data()
+
+# ########################## LayerNorm + Gather at unaligned offsets ##########################
+
+def generate_layer_norm_external_data_unaligned():
+    np.random.seed(0)
+    name = "layer_norm_external_data_unaligned"
+    data_filename = name + ".onnx_data"
+
+    C = 1024
+    X_data       = np.random.randn(2, 3, C).astype(np.float32)
+    scale_data   = np.random.randn(C).astype(np.float32)
+    bias_data    = np.random.randn(C).astype(np.float32)
+    indices_data = np.array([0, 2], dtype=np.int64)
+
+    # 100 and 8292 are multiples of 4 but not of 4096; 16392 is a multiple of 8 but not of 4096.
+    offsets = {"scale": 100, "bias": 8292, "indices": 16392}
+    payload = bytearray()
+    for tensor_name, arr in (("scale", scale_data), ("bias", bias_data), ("indices", indices_data)):
+        off = offsets[tensor_name]
+        assert off >= len(payload), "offsets must be ascending"
+        payload += b"\x00" * (off - len(payload))
+        payload += arr.tobytes()
+    with open("models/{}".format(data_filename), "wb") as f:
+        f.write(payload)
+
+    np_to_onnx = {np.dtype("float32"): TensorProto.FLOAT, np.dtype("int64"): TensorProto.INT64}
+
+    def external_tensor(tensor_name, arr):
+        tensor = TensorProto()
+        tensor.name = tensor_name
+        tensor.data_type = np_to_onnx[arr.dtype]
+        tensor.dims.extend(arr.shape)
+        tensor.data_location = TensorProto.EXTERNAL
+        for key, value in (("location", data_filename), ("offset", str(offsets[tensor_name])),
+                           ("length", str(arr.nbytes))):
+            entry = tensor.external_data.add()
+            entry.key, entry.value = key, value
+        return tensor
+
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, X_data.shape)
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 2, C])
+    nodes = [helper.make_node("LayerNormalization", ["X", "scale", "bias"], ["N"],
+                              axis=-1, epsilon=1e-5),
+             helper.make_node("Gather", ["N", "indices"], ["Y"], axis=1)]
+    initializers = [external_tensor("scale", scale_data), external_tensor("bias", bias_data),
+                    external_tensor("indices", indices_data)]
+    graph = helper.make_graph(nodes, "LayerNormExternalDataUnaligned", [X], [Y], initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.save_model(model, "models/{}.onnx".format(name))
+    onnx.checker.check_model("models/{}.onnx".format(name))
+
+    import onnxruntime as ort
+    out = ort.InferenceSession("models/{}.onnx".format(name)).run(None, {"X": X_data})[0]
+    np.save("data/input_{}.npy".format(name), X_data)
+    np.save("data/output_{}.npy".format(name), out)
+
+generate_layer_norm_external_data_unaligned()
+
+# ########################## External data shorter than the declared shape ##########################
+
+def generate_layer_norm_external_data_truncated():
+    np.random.seed(0)
+    name = "layer_norm_external_data_truncated"
+    data_filename = name + ".onnx_data"
+
+    C = 1024
+    with open("models/{}".format(data_filename), "wb") as f:
+        f.write(b"\x00" * 200)          # scale alone needs 100 + 4096 bytes
+
+    def external_tensor(tensor_name, dtype, dims, offset, length):
+        tensor = TensorProto()
+        tensor.name = tensor_name
+        tensor.data_type = dtype
+        tensor.dims.extend(dims)
+        tensor.data_location = TensorProto.EXTERNAL
+        for key, value in (("location", data_filename), ("offset", str(offset)),
+                           ("length", str(length))):
+            entry = tensor.external_data.add()
+            entry.key, entry.value = key, value
+        return tensor
+
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 3, C])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 3, C])
+    nodes = [helper.make_node("LayerNormalization", ["X", "scale", "bias"], ["Y"],
+                              axis=-1, epsilon=1e-5)]
+    initializers = [external_tensor("scale", TensorProto.FLOAT, [C], 100, 4 * C),
+                    external_tensor("bias", TensorProto.FLOAT, [C], 100 + 4 * C, 4 * C)]
+    graph = helper.make_graph(nodes, "LayerNormExternalDataTruncated", [X], [Y], initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.save_model(model, "models/{}.onnx".format(name))
+
+generate_layer_norm_external_data_truncated()
