@@ -1161,6 +1161,67 @@ model = Resize(input)
 save_data_and_model("resize_size_opset11", input, model, 11)
 save_data_and_model("resize_size_opset13", input, model, 13)
 
+# `If` selecting between two Resize branches.  Branches capture `image`
+# from outer scope (no formal subgraph inputs) per ONNX spec.
+def _if_layer_branch(tag, scale):
+    out_name    = "resized_" + tag
+    scales_name = "scales_" + tag
+    scales = helper.make_node(
+        "Constant", inputs=[], outputs=[scales_name],
+        value=helper.make_tensor("v", TensorProto.FLOAT, [4], [1.0, 1.0, scale, scale]),
+    )
+    resize = helper.make_node(
+        "Resize", inputs=["image", "", scales_name], outputs=[out_name],
+        mode="linear", coordinate_transformation_mode="half_pixel",
+    )
+    out = helper.make_tensor_value_info(out_name, TensorProto.FLOAT,
+                                        ["N", "C", "H_" + tag, "W_" + tag])
+    return helper.make_graph([scales, resize], tag + "_g", inputs=[], outputs=[out])
+
+cond  = helper.make_tensor_value_info("cond",   TensorProto.BOOL,  [1, 1])
+image = helper.make_tensor_value_info("image",  TensorProto.FLOAT, ["N", "C", "H", "W"])
+out   = helper.make_tensor_value_info("output", TensorProto.FLOAT, ["N", "C", "H_o", "W_o"])
+if_node = helper.make_node(
+    "If", inputs=["cond"], outputs=["output"], name="If_Resize",
+    then_branch=_if_layer_branch("then", 0.5),
+    else_branch=_if_layer_branch("else", 0.25),
+)
+graph = helper.make_graph([if_node], "if_layer", inputs=[cond, image], outputs=[out])
+model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+onnx.checker.check_model(model)
+onnx.save(model, os.path.join("models", "if_layer.onnx"))
+
+# Spec-violating If: 2 inputs (cond, x).  parseIf must reject.
+def _if_layer_branch_with_input(tag, op, scale):
+    in_name  = tag + "_in"
+    out_name = tag + "_out"
+    k_name   = tag + "_k"
+    bin_ = helper.make_tensor_value_info(in_name,  TensorProto.FLOAT, [1])
+    out  = helper.make_tensor_value_info(out_name, TensorProto.FLOAT, [1])
+    nodes = []
+    if op == "Identity":
+        nodes.append(helper.make_node("Identity", [in_name], [out_name]))
+    elif op == "Add":
+        nodes.append(helper.make_node(
+            "Constant", inputs=[], outputs=[k_name],
+            value=helper.make_tensor("v", TensorProto.FLOAT, [1], [scale]),
+        ))
+        nodes.append(helper.make_node("Add", [in_name, k_name], [out_name]))
+    return helper.make_graph(nodes, tag + "_g_bad", inputs=[bin_], outputs=[out])
+
+cond = helper.make_tensor_value_info("cond", TensorProto.BOOL,  [1])
+x    = helper.make_tensor_value_info("x",    TensorProto.FLOAT, [1])
+y    = helper.make_tensor_value_info("y",    TensorProto.FLOAT, [1])
+bad_if = helper.make_node(
+    "If", inputs=["cond", "x"], outputs=["y"], name="If_MultiInput",
+    then_branch=_if_layer_branch_with_input("then", "Identity", 1.0),
+    else_branch=_if_layer_branch_with_input("else", "Add",     10.0),
+)
+graph = helper.make_graph([bad_if], "if_layer_multi_inputs",
+                          inputs=[cond, x], outputs=[y])
+model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+onnx.save(model, os.path.join("models", "if_layer_multi_inputs.onnx"))
+
 class ShapeConst(nn.Module):
     def __init__(self):
         super(ShapeConst, self).__init__()
