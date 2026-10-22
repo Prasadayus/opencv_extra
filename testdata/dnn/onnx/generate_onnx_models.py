@@ -3309,6 +3309,46 @@ def generate_resize_no_scales(name="resize_no_scales"):
 
 generate_resize_no_scales()
 
+def generate_qconv_bias_case(name, x_scale, w_scale, w_zp, num_out, bias):
+    # QLinearConv with constant x_scale, w_scale and int32 bias. The importer
+    # folds the bias to float using x_scale[0] and the per-channel w_scale, so
+    # these inputs must agree with each other. Load-only model, no reference data.
+    X = onnx.helper.make_tensor_value_info("x", TensorProto.UINT8, [1, 1, 2, 2])
+    Y = onnx.helper.make_tensor_value_info("y", TensorProto.UINT8, [1, num_out, 2, 2])
+    inits = [
+        onnx.numpy_helper.from_array(x_scale, "x_scale"),
+        onnx.numpy_helper.from_array(np.array(0, dtype=np.uint8), "x_zp"),
+        onnx.numpy_helper.from_array(np.ones((num_out, 1, 1, 1), dtype=np.int8), "w"),
+        onnx.numpy_helper.from_array(w_scale, "w_scale"),
+        onnx.numpy_helper.from_array(w_zp, "w_zp"),
+        onnx.numpy_helper.from_array(np.array(0.25, dtype=np.float32), "y_scale"),
+        onnx.numpy_helper.from_array(np.array(0, dtype=np.uint8), "y_zp"),
+        onnx.numpy_helper.from_array(bias, "B"),
+    ]
+    node = onnx.helper.make_node("QLinearConv",
+                                 ["x", "x_scale", "x_zp", "w", "w_scale", "w_zp", "y_scale", "y_zp", "B"],
+                                 ["y"])
+    graph = onnx.helper.make_graph([node], name, [X], [Y], initializer=inits)
+    model = onnx.helper.make_model(graph, producer_name=name,
+                                   opset_imports=[onnx.helper.make_opsetid("", 10)])
+    model.ir_version = 7
+    onnx.checker.check_model(model)
+    onnx.save(model, "models/{}.onnx".format(name))
+
+# Per-channel w_scale with 64 entries but a 1-element bias: the fold loop ran
+# over w_scale and wrote past the bias buffer.
+generate_qconv_bias_case("qconv_bias_scale_mismatch",
+                         x_scale=np.array(0.5, dtype=np.float32),
+                         w_scale=np.full(64, 0.1, dtype=np.float32),
+                         w_zp=np.zeros(64, dtype=np.int8),
+                         num_out=64, bias=np.array([7], dtype=np.int32))
+# Empty x_scale: the fold read x_scale[0] unconditionally.
+generate_qconv_bias_case("qconv_empty_x_scale",
+                         x_scale=np.zeros(0, dtype=np.float32),
+                         w_scale=np.array(0.1, dtype=np.float32),
+                         w_zp=np.array(0, dtype=np.int8),
+                         num_out=1, bias=np.array([7], dtype=np.int32))
+
 ################# GELU #################
 
 x = torch.randn(1, 5, 20)
@@ -4244,3 +4284,249 @@ def generate_multi_head_attention_models():
     print("input counts:", n1, n2, n3)
 
 generate_multi_head_attention_models()
+
+def generate_deconv_gemm():
+    import onnxruntime as ort
+
+    def export(deconv, x, name):
+        with torch.no_grad():
+            deconv.weight.uniform_(-0.5, 0.5)
+            deconv.bias.uniform_(-0.2, 0.2)
+        deconv.eval()
+        path = os.path.join("models", name + ".onnx")
+        with torch.no_grad():
+            expected = deconv(x)
+            torch.onnx.export(deconv, x, path, input_names=["input"], output_names=["output"],
+                              opset_version=13, dynamo=False)
+        actual = ort.InferenceSession(path).run(None, {"input": x.numpy()})[0]
+        max_diff = np.abs(actual - expected.numpy()).max()
+        assert max_diff < 1e-5, "PyTorch/onnxruntime mismatch for {}: {}".format(name, max_diff)
+        np.save(os.path.join("data", "input_" + name + ".npy"), x.numpy())
+        np.save(os.path.join("data", "output_" + name + ".npy"), np.ascontiguousarray(expected.numpy()))
+
+    torch.manual_seed(5)
+
+    # kernel == stride: every output pixel gets exactly one tap (SAM decoder upsampling);
+    # 20 output channels leave the last channel block partial
+    export(nn.ConvTranspose2d(16, 20, kernel_size=2, stride=2), torch.empty(1, 16, 6, 5).uniform_(-1, 1),
+           "deconv_k2s2")
+
+    # overlapping taps with 40 output channels, split into several channel chunks, the last one partial
+    export(nn.ConvTranspose2d(16, 40, kernel_size=3, stride=2, padding=1, output_padding=1),
+           torch.empty(1, 16, 7, 6).uniform_(-1, 1), "deconv_overlap_chunks")
+
+    # two groups of 6 input channels, so the second group starts inside a channel block
+    export(nn.ConvTranspose2d(12, 48, kernel_size=4, stride=2, padding=1, groups=2),
+           torch.empty(2, 12, 5, 6).uniform_(-1, 1), "deconv_overlap_groups")
+
+generate_deconv_gemm()
+
+def generate_deconv_empty():
+    # Dynamic N/H/W for zero-size inputs. Bias is arange(12), so an output made only of bias is easy
+    # to check; 12 output channels leave the last channel block partial.
+    def export(name, kernel):
+        cin, cout = 4, 12
+        w = np.random.uniform(-0.5, 0.5, (cin, cout, kernel, kernel)).astype(np.float32)
+        b = np.arange(cout, dtype=np.float32)
+        node = onnx.helper.make_node("ConvTranspose", ["input", "weight", "bias"], ["output"],
+                                     kernel_shape=[kernel, kernel])
+        graph = onnx.helper.make_graph(
+            [node], name,
+            [onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, ["n", cin, "h", "w"])],
+            [onnx.helper.make_tensor_value_info("output", onnx.TensorProto.FLOAT, ["n", cout, "oh", "ow"])],
+            [onnx.numpy_helper.from_array(w, "weight"), onnx.numpy_helper.from_array(b, "bias")])
+        model = onnx.helper.make_model(graph, producer_name=name, opset_imports=[onnx.helper.make_opsetid("", 13)])
+        onnx.checker.check_model(model)
+        onnx.save(model, os.path.join("models", name + ".onnx"))
+
+    np.random.seed(7)
+    export("deconv_empty_k1", 1)  # H = 0 gives an empty output
+    export("deconv_empty_k3", 3)  # H = 0 gives two output rows of pure bias
+
+generate_deconv_empty()
+
+def generate_convtranspose_perf():
+    # Single-node models for perf_convtranspose.cpp. The weights come from ConstantOfShape, which
+    # the importer folds into constants, so each model stays a few hundred bytes.
+    def export(name, cin, cout, kernel, stride, pad, out_pad, groups, size):
+        def constant(out, shape, value):
+            return [onnx.helper.make_node("Constant", [], [out + "_shape"],
+                                          value=onnx.numpy_helper.from_array(np.array(shape, np.int64))),
+                    onnx.helper.make_node("ConstantOfShape", [out + "_shape"], [out],
+                                          value=onnx.helper.make_tensor("value", onnx.TensorProto.FLOAT, [1], [value]))]
+        nodes = constant("W", [cin, cout // groups, kernel, kernel], 0.01) + constant("B", [cout], 0.1)
+        nodes.append(onnx.helper.make_node("ConvTranspose", ["input", "W", "B"], ["output"],
+                                           kernel_shape=[kernel, kernel], strides=[stride, stride],
+                                           pads=[pad] * 4, output_padding=[out_pad, out_pad], group=groups))
+        out_size = (size - 1) * stride - 2 * pad + kernel + out_pad
+        graph = onnx.helper.make_graph(
+            nodes, name,
+            [onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1, cin, size, size])],
+            [onnx.helper.make_tensor_value_info("output", onnx.TensorProto.FLOAT, [1, cout, out_size, out_size])])
+        model = onnx.helper.make_model(graph, producer_name=name, opset_imports=[onnx.helper.make_opsetid("", 13)])
+        onnx.checker.check_model(model)
+        onnx.save(model, os.path.join("models", "convtranspose_perf_" + name + ".onnx"))
+
+    export("sam2_256_64", 256, 64, 2, 2, 0, 0, 1, 64)
+    export("sam2_64_32", 64, 32, 2, 2, 0, 0, 1, 128)
+    export("sam3_256_64", 256, 64, 2, 2, 0, 0, 1, 72)
+    export("sam3_64_32", 64, 32, 2, 2, 0, 0, 1, 144)
+    export("unet_256_128_k4s2p1", 256, 128, 4, 2, 1, 0, 1, 32)
+    export("gan_128_64_k4s2p1", 128, 64, 4, 2, 1, 0, 1, 64)
+    export("128_64_k3s2p1op1", 128, 64, 3, 2, 1, 1, 1, 64)
+    export("64_64_k3s1p1", 64, 64, 3, 1, 1, 0, 1, 64)
+    export("group4_128_128_k4s2p1", 128, 128, 4, 2, 1, 0, 4, 32)
+    export("depthwise_64_k4s2p1", 64, 64, 4, 2, 1, 0, 64, 64)
+
+generate_convtranspose_perf()
+
+def save_with_ort_reference(name, nodes, initializers, x, out_shape):
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, list(x.shape))
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, out_shape)
+    graph = helper.make_graph(nodes, name, [X], [Y], initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model = onnx.shape_inference.infer_shapes(model)
+    onnx.save(model, "models/{}.onnx".format(name))
+    import onnxruntime as ort
+    out = ort.InferenceSession("models/{}.onnx".format(name)).run(["Y"], {"X": x})[0]
+    np.save("data/input_{}.npy".format(name), x)
+    np.save("data/output_{}.npy".format(name), out)
+
+def generate_batchnorm_affine_fold(name, C, spatial, mul_shape, add_shape):
+    # BatchNorm, then Mul and Add by constants, as in DenseNet: the chain pass folds them into
+    # the BatchNorm when they are scalar or per channel. A per-row Mul must stay separate.
+    np.random.seed(0x12345)
+    S = spatial
+    rand = lambda *shape: np.asarray(np.random.randn(*shape), dtype=np.float32)
+    initializers = [
+        numpy_helper.from_array(np.abs(rand(C)) + 0.5, "gamma"),
+        numpy_helper.from_array(rand(C), "beta"),
+        numpy_helper.from_array(rand(C) * 0.1, "mean"),
+        numpy_helper.from_array(np.abs(rand(C)) + 0.5, "var"),
+        numpy_helper.from_array(rand(*mul_shape) + 1.0, "s"),
+        numpy_helper.from_array(rand(16, C, 3, 3) / (C * 3), "W"),
+    ]
+    nodes = [
+        helper.make_node("BatchNormalization", ["X", "gamma", "beta", "mean", "var"], ["N"],
+                         epsilon=1e-5),
+        helper.make_node("Mul", ["N", "s"], ["M"]),
+    ]
+    last = "M"
+    if add_shape is not None:
+        initializers.append(numpy_helper.from_array(rand(*add_shape), "b"))
+        nodes.append(helper.make_node("Add", ["M", "b"], ["A"]))
+        last = "A"
+    nodes += [
+        helper.make_node("Relu", [last], ["R"]),
+        helper.make_node("Conv", ["R", "W"], ["Y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+    ]
+    save_with_ort_reference(name, nodes, initializers, rand(1, C, S, S) * 0.5, [1, 16, S, S])
+
+generate_batchnorm_affine_fold("batchnorm_mul_add", 12, 10, (12, 1, 1), ())
+# [C,1] on a C x C plane scales rows, so it must not be folded as per channel
+generate_batchnorm_affine_fold("batchnorm_mul_rows", 12, 12, (12, 1), None)
+
+def generate_block_layout_fixtures():
+    # Layers that keep or avoid block layout without a conversion around them.
+    # MaxPool and ConvTranspose precede the op under test, as Conv would absorb it.
+    np.random.seed(0x12345)
+    rand = lambda *shape: np.asarray(np.random.randn(*shape), dtype=np.float32)
+    weights = lambda name, *shape: numpy_helper.from_array(
+        rand(*shape) / np.float32(np.sqrt(np.prod(shape[1:]))), name)
+
+    # AveragePool keeps a plain input plain, borders included
+    nodes = [helper.make_node("AveragePool", ["X"], ["P"], kernel_shape=[3, 3], strides=[2, 2],
+                              pads=[1, 1, 1, 1], count_include_pad=0),
+             helper.make_node("AveragePool", ["P"], ["Y"], kernel_shape=[3, 3], strides=[1, 1],
+                              pads=[1, 1, 1, 1], count_include_pad=1)]
+    save_with_ort_reference("avgpool_plain_input", nodes, [], rand(2, 1, 15, 20), [2, 1, 8, 10])
+
+    # Mul by a scalar between two block layers stays in block layout
+    nodes = [helper.make_node("Conv", ["X", "W1"], ["A"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+             helper.make_node("MaxPool", ["A"], ["B"], kernel_shape=[2, 2], strides=[2, 2]),
+             helper.make_node("Mul", ["B", "s"], ["M"]),
+             helper.make_node("Conv", ["M", "W2"], ["Y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])]
+    inits = [weights("W1", 16, 8, 3, 3), weights("W2", 16, 16, 3, 3),
+             numpy_helper.from_array(np.array(0.5, np.float32), "s")]
+    save_with_ort_reference("eltwise_scalar_block", nodes, inits, rand(1, 8, 12, 12), [1, 16, 6, 6])
+
+    # global average and max pooling read and write block layout; C = 12 has padding lanes
+    for C in [12, 16]:
+        nodes = [helper.make_node("Conv", ["X", "W"], ["F"], kernel_shape=[3, 3],
+                                  pads=[1, 1, 1, 1]),
+                 helper.make_node("GlobalAveragePool", ["F"], ["GA"]),
+                 helper.make_node("GlobalMaxPool", ["F"], ["GM"]),
+                 helper.make_node("Conv", ["GA", "WA"], ["A"], kernel_shape=[1, 1]),
+                 helper.make_node("Conv", ["GM", "WM"], ["M"], kernel_shape=[1, 1]),
+                 helper.make_node("Concat", ["A", "M"], ["Y"], axis=1)]
+        inits = [weights("W", C, 8, 3, 3), weights("WA", 8, C, 1, 1), weights("WM", 8, C, 1, 1)]
+        save_with_ort_reference("global_pool_block_c{}".format(C), nodes, inits,
+                                rand(1, 8, 10, 10), [1, 16, 1, 1])
+
+    # elementwise ops between a 1-channel block output and Squeeze run after the conversion
+    nodes = [helper.make_node("ConvTranspose", ["X", "W"], ["T"], kernel_shape=[2, 2],
+                              strides=[2, 2]),
+             helper.make_node("Sigmoid", ["T"], ["S"]),
+             helper.make_node("Add", ["S", "b"], ["A"]),
+             helper.make_node("Squeeze", ["A", "axes"], ["Y"])]
+    inits = [weights("W", 8, 1, 2, 2),
+             numpy_helper.from_array(np.full((1, 1, 1, 1), 0.25, np.float32), "b"),
+             numpy_helper.from_array(np.array([1], np.int64), "axes")]
+    save_with_ort_reference("convtranspose_sigmoid_add", nodes, inits, rand(1, 8, 8, 8),
+                            [1, 16, 16])
+
+generate_block_layout_fixtures()
+
+def generate_slice_channel_fixtures():
+    # Slice on the channel axis between two Convs, its bounds computed from the shape at runtime;
+    # a constant cut off whole blocks keeps the plain path.
+    np.random.seed(0x12345)
+    rand = lambda *shape: np.asarray(np.random.randn(*shape), dtype=np.float32)
+    weights = lambda name, *shape: numpy_helper.from_array(
+        rand(*shape) / np.float32(np.sqrt(np.prod(shape[1:]))), name)
+    ints = lambda name, values: numpy_helper.from_array(np.array(values, np.int64), name)
+    conv = lambda inp, w, out, k: helper.make_node("Conv", [inp, w], [out], kernel_shape=[k, k],
+                                                   pads=[k // 2] * 4)
+    channels = [helper.make_node("Shape", ["A"], ["shape"]),
+                helper.make_node("Gather", ["shape", "one"], ["C"], axis=0)]
+
+    # the second half of 64 channels: whole blocks
+    nodes = [conv("X", "W1", "A", 3)] + channels + [
+        helper.make_node("Div", ["C", "two"], ["half"]),
+        helper.make_node("Unsqueeze", ["half", "axis0"], ["starts"]),
+        helper.make_node("Unsqueeze", ["C", "axis0"], ["ends"]),
+        helper.make_node("Slice", ["A", "starts", "ends", "axes", "steps"], ["S"]),
+        conv("S", "W2", "Y", 1)]
+    inits = [weights("W1", 64, 8, 3, 3), weights("W2", 16, 32, 1, 1), ints("one", 1),
+             ints("two", 2), ints("axis0", [0]), ints("axes", [1]), ints("steps", [1])]
+    save_with_ort_reference("slice_channels_block", nodes, inits, rand(1, 8, 12, 12),
+                            [1, 16, 12, 12])
+
+    # channels [3, 17) of 20 and rows [1:11:2]: each output block spans two input blocks
+    nodes = [conv("X", "W1", "A", 3)] + channels + [
+        helper.make_node("Sub", ["C", "c17"], ["cs"]),
+        helper.make_node("Sub", ["C", "c3"], ["ce"]),
+        helper.make_node("Unsqueeze", ["cs", "axis0"], ["cs1"]),
+        helper.make_node("Unsqueeze", ["ce", "axis0"], ["ce1"]),
+        helper.make_node("Concat", ["cs1", "row_start"], ["starts"], axis=0),
+        helper.make_node("Concat", ["ce1", "row_end"], ["ends"], axis=0),
+        helper.make_node("Slice", ["A", "starts", "ends", "axes", "steps"], ["S"]),
+        conv("S", "W2", "Y", 1)]
+    inits = [weights("W1", 20, 8, 3, 3), weights("W2", 8, 14, 1, 1), ints("one", 1),
+             ints("c17", 17), ints("c3", 3), ints("axis0", [0]), ints("row_start", [1]),
+             ints("row_end", [11]), ints("axes", [1, 2]), ints("steps", [1, 2])]
+    save_with_ort_reference("slice_channels_block_unaligned", nodes, inits, rand(1, 8, 12, 12),
+                            [1, 8, 5, 12])
+
+    # constant channels [2, 10) of 16
+    nodes = [conv("X", "W1", "A", 3),
+             helper.make_node("Slice", ["A", "starts", "ends", "axes"], ["S"]),
+             conv("S", "W2", "Y", 1)]
+    inits = [weights("W1", 16, 8, 3, 3), weights("W2", 8, 8, 1, 1), ints("starts", [2]),
+             ints("ends", [10]), ints("axes", [1])]
+    save_with_ort_reference("slice_channels_const_unaligned", nodes, inits, rand(1, 8, 12, 12),
+                            [1, 8, 12, 12])
+
+generate_slice_channel_fixtures()
